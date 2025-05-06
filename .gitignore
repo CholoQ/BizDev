@@ -1,0 +1,14 @@
+# Python virtual environment
+venv/
+.venv/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Other common Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.env

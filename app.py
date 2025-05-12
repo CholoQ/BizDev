@@ -3,6 +3,10 @@ import google.generativeai as genai
 import os
 import re # 正規表現モジュールをインポート
 
+from duckduckgo_search import DDGS
+from googleapiclient.discovery import build # Google APIクライアントライブラリ
+
+
 # --- 改善されたパース関数 ---
 def parse_lean_canvas_response(text):
     parsed_blocks = {}
@@ -41,6 +45,55 @@ def parse_lean_canvas_response(text):
         parsed_blocks["解析エラー"] = draft_section # 解析できなかった部分全体を入れる
 
     return score_text, parsed_blocks # スコア文字列とブロック辞書を返す
+
+# --- VPCパース関数の例 (簡易版) ---
+def parse_vpc_response(text):
+    parsed_vpc_blocks = {}
+    # VPCの6ブロックの想定される見出し (AIの出力に合わせる)
+    # プロンプトで指定した見出し形式 "## 見出し名 (英語名)" を想定
+    vpc_headings_map = {
+        "顧客のジョブ": "顧客のジョブ (Customer Jobs)", # 表示名: プロンプト内の見出し名
+        "ペイン": "顧客のペイン (Customer Pains)",
+        "ゲイン": "顧客のゲイン (Customer Gains)",
+        "製品・サービス": "製品・サービス (Products & Services)",
+        "ペインリリーバー": "ペインリリーバー (Pain Relievers)",
+        "ゲインクリエイター": "ゲインクリエイター (Gain Creators)"
+    }
+    # より頑健にするには正規表現の詳細化が必要
+    current_heading_key = None
+    current_content = []
+
+    if not text: # textがNoneや空の場合の処理
+        return parsed_vpc_blocks
+
+    for line in text.splitlines():
+        matched_heading = None
+        for display_name, actual_heading_pattern in vpc_headings_map.items():
+            # 見出し行を探す (行頭が ## で始まり、指定の見出し名を含むか)
+            # AIの出力が "## 顧客のジョブ (Customer Jobs)" のような形式を期待
+            if line.strip().startswith(f"## {actual_heading_pattern}"):
+                matched_heading = display_name # 表示名をキーとして使う
+                break
+        
+        if matched_heading:
+            if current_heading_key and current_content:
+                parsed_vpc_blocks[current_heading_key] = "\n".join(current_content).strip()
+            current_heading_key = matched_heading
+            current_content = []
+        elif current_heading_key:
+            current_content.append(line)
+    
+    # 最後のブロックを保存
+    if current_heading_key and current_content:
+        parsed_vpc_blocks[current_heading_key] = "\n".join(current_content).strip()
+
+    # 想定されるキーが全て揃っているか確認し、なければ空文字で初期化
+    for display_name in vpc_headings_map.keys():
+        if display_name not in parsed_vpc_blocks:
+            parsed_vpc_blocks[display_name] = ""
+
+    return parsed_vpc_blocks
+# --- VPCパース関数ここまで ---
 
 # --- APIキーの設定 (変更なし) ---
 try:
@@ -133,84 +186,114 @@ if st.session_state.step == 0:
 
 # --- ステップ1: 壁打ち - ターゲット戦略 ---
 elif st.session_state.step == 1:
-   
     st.header("ステップ1: 壁打ち - ターゲット戦略")
-    st.caption("AIが提案したターゲット戦略のアイデアを確認してください。")
+    st.info("""
+    AIがあなたの技術概要に基づいて、有望と思われるターゲット市場や具体的な顧客像のアイデアを提案します。
+    これらのアイデアを元に、どの顧客層に焦点を当てるか検討し、一つ選択または自由記述してください。
+    ここで選んだターゲットが、この後の分析の軸となります。
+    """)
+    st.caption("AIが提案したターゲット戦略のアイデア、またはご自身で考えるターゲットについて、顧客課題の整理に進みます。") # キャプション修正
     st.divider()
 
     st.subheader("AIによるターゲット戦略提案")
     if 'target_strategy_ideas' in st.session_state and st.session_state.target_strategy_ideas:
-        st.markdown(st.session_state.target_strategy_ideas) # ← ここで結果が表示されるはず
-    else:
-        st.warning("ターゲット戦略のアイデアがまだ生成されていません。ステップ0に戻ってください。")
-    
-    st.divider()
-    st.subheader("ターゲットの選択")
-    st.caption("提案された中から、最も有望だと思うターゲットを1つ選択してください。")
+        st.markdown(st.session_state.target_strategy_ideas)
 
-    # --- ↓↓↓ ターゲット選択UIを追加 ↓↓↓ ---
-    # target_strategy_ideas が文字列の場合、パースしてリストにする必要がある
-    # (簡易的なパース例： "**ターゲット案X:**" で始まる行を抽出)
-    target_options = []
-    if 'target_strategy_ideas' in st.session_state and st.session_state.target_strategy_ideas:
-        # splitlines() で行に分割し、太字で始まる行をオプションとして抽出
-        target_options = [line.strip() for line in st.session_state.target_strategy_ideas.splitlines() if line.strip().startswith("**ターゲット案")]
-        # オプションがない場合の処理
-        if not target_options:
-             st.warning("ターゲット案の選択肢を抽出できませんでした。AIの応答形式を確認してください。")
+        # --- ↓↓↓ ターゲット選択UIを修正 ↓↓↓ ---
+        st.divider()
+        st.subheader("ターゲットの選択または入力")
 
-   # ラジオボタンで選択肢を表示
-    if target_options:
+        # target_strategy_ideas から選択肢を抽出
+        target_options = []
+        raw_ideas_text = st.session_state.target_strategy_ideas
+        # "**ターゲット案X:**" で始まる行を抽出 (タイトル行全体)
+        extracted_options = [line.strip() for line in raw_ideas_text.splitlines() if line.strip().startswith("**ターゲット案")]
+        if extracted_options:
+             target_options.extend(extracted_options)
+        else:
+             st.warning("AI提案から選択肢を抽出できませんでした。手動で入力してください。")
+
+        # 「その他」選択肢を追加
+        other_option = "その他（自由記述）"
+        target_options.append(other_option)
+
+        # ラジオボタンで選択
         selected_target_option = st.radio(
-            "ターゲットを選択:",
+            "ターゲットを選択、または「その他」を選んで自由記述してください:",
             options=target_options,
             key="target_selection_radio",
-            # label_visibility="collapsed" # ラベルを隠す場合
+            index=len(target_options)-1 # デフォルトで「その他」を選択状態にする場合
+            # index=0 # デフォルトで最初の提案を選択状態にする場合
         )
 
-        # 選択されたターゲットを表示（確認用）
-        st.write(f"選択中: {selected_target_option}")
+        # 「その他」が選択されたら自由記述欄を表示
+        manual_target_input = ""
+        if selected_target_option == other_option:
+            manual_target_input = st.text_area(
+                "ターゲット顧客（セグメント、ペルソナなど）を具体的に記述してください:",
+                key="manual_target_input",
+                height=150
+            )
 
         # 課題整理へ進むボタン
-        if st.button("選択したターゲットの課題整理へ進む", key="goto_problem_definition"):
-            if selected_target_option:
-                # 選択されたターゲット情報をsession_stateに保存
-                st.session_state.selected_target = selected_target_option
-                # ここで「課題整理」のためのAI呼び出し等を行うが、まずは画面遷移だけ実装
-                st.session_state.step = 1.2 # 次のサブステップへ (仮番号)
-                st.rerun()
-            else:
-                st.warning("ターゲットを選択してください。")
-    # --- ↑↑↑ ターゲット選択UIを追加 ↑↑↑ ---
+        if st.button("選択/入力したターゲットの課題整理へ進む", key="goto_problem_definition"):
+            final_selected_target = ""
+            valid_selection = False
 
+            if selected_target_option == other_option:
+                if manual_target_input.strip(): # 自由記述欄に入力があるか
+                    final_selected_target = manual_target_input.strip()
+                    valid_selection = True
+                else:
+                    st.warning("「その他」を選択した場合は、ターゲットを自由記述欄に入力してください。")
+            else: # AI提案から選択された場合
+                final_selected_target = selected_target_option # ラジオボタンの選択肢（タイトル行全体）をそのまま使う
+                valid_selection = True
+
+            if valid_selection:
+                # 選択/入力されたターゲット情報をsession_stateに保存
+                st.session_state.selected_target = final_selected_target
+                # 課題リストはクリアしておく（ターゲットが変わったので再生成）
+                if 'potential_problems' in st.session_state:
+                    del st.session_state.potential_problems
+                st.session_state.step = 1.2 # 次のサブステップへ
+                st.rerun()
+        # --- ↑↑↑ ターゲット選択UIを修正 ↑↑↑ ---
+
+    else:
+        st.warning("ターゲット戦略のアイデアがまだ生成されていません。ステップ0に戻ってください。")
+        # (戻るボタンのロジックは変更なし)
 
     st.divider()
-    # st.info("次のステップ（VPC作成など）は未実装です。") # メッセージ更新
+    # st.info("次のステップ（課題整理、VPC作成など）は未実装です。") # このinfoは不要になる
 
-    # ナビゲーション（仮）
+    # ナビゲーション（仮） - ステップ0に戻るボタンのみ残す
     if st.button("ステップ0（入力）に戻る"):
         st.session_state.step = 0
-        # 必要に応じてsession_stateをクリア
-        if 'target_strategy_ideas' in st.session_state:
-            del st.session_state.target_strategy_ideas
-        if 'selected_target' in st.session_state:
-             del st.session_state.selected_target
+        if 'target_strategy_ideas' in st.session_state: del st.session_state.target_strategy_ideas
+        if 'selected_target' in st.session_state: del st.session_state.selected_target
         st.rerun()
 
 # --- ステップ1.2: 壁打ち - 課題整理 ---
 elif st.session_state.step == 1.2:
     st.header("ステップ1: 壁打ち - 課題整理")
-    st.caption("選択したターゲットが抱えている可能性のある課題をAIがリストアップしました。")
+    st.info("""
+    ステップ1で選択/入力したターゲット顧客が抱えている可能性のある「課題」や「ペイン（悩み・不満）」をAIがリストアップします。
+    これらの課題の中から、あなたの技術で解決できそうな、特に重要だと考えるものを複数選択してください。
+    ここで選んだ課題が、次のValue Proposition Canvas作成の重要なインプットになります。
+    """)
+    st.caption("AIがリストアップした課題の中から、特に重要だと思うもの、解決したいと思うものを選択してください。") # キャプション変更
     st.divider()
 
-    # 選択されたターゲットを表示
+    # 選択されたターゲットを表示 (変更なし)
     selected_target = st.session_state.get('selected_target', '（ターゲットが選択されていません）')
     st.subheader("選択されたターゲット")
     st.write(selected_target)
     st.divider()
 
-    # --- AIによる課題リスト生成 (まだ生成されていなければ) ---
+    # --- AIによる課題リスト生成 (変更なし) ---
     if 'potential_problems' not in st.session_state:
+        # (AI呼び出しロジックは前回と同じ)
         st.info("AIが課題を分析中です...")
         tech_summary = st.session_state.get('tech_summary', '')
         if not tech_summary:
@@ -219,10 +302,12 @@ elif st.session_state.step == 1.2:
         if not selected_target or selected_target == '（ターゲットが選択されていません）':
              st.error("ターゲットが選択されていません。ステップ1に戻ってください。")
              st.stop()
-
-        # プロンプト作成 (課題リストアップ用)
-        problem_prompt = f"""以下の「技術概要」と、その技術の「ターゲット候補」について分析してください。
-        このターゲット候補が抱えている可能性のある「課題」や「ペイン（悩み、不満、困りごと）」を、できるだけ具体的に5～10個程度リストアップしてください。
+       
+       # --- ↓↓↓ プロンプトを修正 ↓↓↓ ---
+        problem_prompt = f"""あなたは、新規事業のアイデアを検討するコンサルタントです。
+        以下の「技術概要」と、その技術の「ターゲット候補」に関する情報を分析してください。
+        そして、**このターゲット候補が抱えている可能性のある「課題」や「ペイン（悩み、不満、困りごと）」**を、できるだけ具体的に5～10個程度リストアップしてください。
+        この分析は、これまでの会話とは独立した、今回提示された情報のみに基づいて行ってください。
 
         # 技術概要:
         {tech_summary}
@@ -235,112 +320,136 @@ elif st.session_state.step == 1.2:
         * [具体的な課題やペイン2]
         * ...
         """
+        # --- ↑↑↑ プロンプトを修正 ↑↑↑ ---
 
         try:
             with st.spinner("Geminiが課題を分析中..."):
-                 # 注意: model変数が利用可能であること
                  response_problems = model.generate_content(problem_prompt)
                  st.session_state.potential_problems = response_problems.text
                  st.success("課題リストの生成が完了しました。")
-                 # 結果を表示するためにリラン（必須ではないが表示がスムーズになる）
                  st.rerun()
         except Exception as e:
             st.error(f"課題リスト生成中にエラーが発生しました: {e}")
             st.session_state.potential_problems = "課題リストの生成に失敗しました。"
 
+    # --- ★★★ 課題リスト表示と選択UI ★★★ ---
+    st.subheader("AIが考えたターゲットの課題リスト（複数選択可）")
 
-    # --- 生成された課題リストの表示 ---
-    st.subheader("AIが考えたターゲットの課題リスト")
-    if 'potential_problems' in st.session_state:
-        st.markdown(st.session_state.potential_problems)
+    selected_problems_list = [] # 選択された課題を格納するリスト
+    potential_problems_text = st.session_state.get('potential_problems', '')
+
+    if potential_problems_text and potential_problems_text != "課題リストの生成に失敗しました。":
+        # AI応答テキストを解析して課題リストを作成 (簡易版: 行ごとに分割し、'*'などを除去)
+        problem_lines = [line.strip('* ') for line in potential_problems_text.splitlines() if line.strip() and line.strip().startswith('*')]
+        if not problem_lines: # もし'*'で始まらない形式なら、空行以外をそのまま使う
+             problem_lines = [line.strip() for line in potential_problems_text.splitlines() if line.strip()]
+
+        if problem_lines:
+            # 各課題に対してチェックボックスを表示
+            for i, problem in enumerate(problem_lines):
+                key = f"problem_select_{i}"
+                # チェックボックスの状態は st.session_state に自動で保存される
+                is_selected = st.checkbox(problem, key=key)
+                if is_selected:
+                    selected_problems_list.append(problem) # チェックされたらリストに追加
+        else:
+            st.warning("課題リストの解析に失敗したか、課題が見つかりませんでした。AIの応答を確認してください。")
+            st.text(potential_problems_text) # 生の応答を表示
+
     else:
-        # 通常は上記のAI生成ブロックが実行されるはず
-        st.info("課題リストを生成しています...")
+        st.info("課題リストを生成中です...")
 
     st.divider()
 
     # --- ナビゲーション ---
-    if st.button("ステップ1（ターゲット選択）に戻る", key="back_to_step1"):
-        st.session_state.step = 1
-        # 関連するsession_stateをクリア
-        if 'potential_problems' in st.session_state:
-            del st.session_state.potential_problems
-        # selected_target はステップ1で再選択するのでクリア不要かも
-        st.rerun()
-
-    if st.button("次のステップ（VPC作成）へ進む", key="goto_vpc"): # 将来的に追加
-        #ユーザーが選択・評価した課題情報を保存する処理など
-        st.session_state.step = 1.3 # 仮のステップ番号
-        st.rerun()
+    col_nav1, col_nav2 = st.columns(2)
+    with col_nav1:
+        if st.button("ステップ1（ターゲット選択）に戻る", key="back_to_step1_from_1_2"): # キー名を変更
+            st.session_state.step = 1
+            if 'potential_problems' in st.session_state: del st.session_state.potential_problems
+            if 'selected_problems' in st.session_state: del st.session_state.selected_problems # 選択結果もクリア
+            st.rerun()
+    with col_nav2:
+        # ↓↓↓ ボタンのロジックを修正 ↓↓↓
+        if st.button("選択した課題でVPC作成へ進む", key="goto_vpc_from_1_2"): # ボタン名変更、キー名変更
+            if selected_problems_list: # 課題が1つ以上選択されているかチェック
+                # 選択された課題リストをsession_stateに保存
+                st.session_state.selected_problems = selected_problems_list
+                st.session_state.step = 1.3 # 次のステップへ
+                # VPCドラフトはクリアしておく（インプットが変わるので再生成）
+                if 'vpc_draft_text' in st.session_state: del st.session_state.vpc_draft_text
+                if 'vpc_final_data' in st.session_state: del st.session_state.vpc_final_data # 編集データもクリア
+                st.rerun()
+            else:
+                st.warning("VPC作成に進むには、少なくとも1つの課題を選択してください。")
+        # --- ↑↑↑ ボタンのロジックを修正 ↑↑↑ ---
 
 # --- ステップ1.3: 壁打ち - Value Proposition Canvas作成支援 ---
 elif st.session_state.step == 1.3:
     st.header("ステップ1: 壁打ち - Value Proposition Canvas")
+    st.info("""
+    Value Proposition Canvas (VPC) を使って、顧客への提供価値を具体化します。
+    AIが、これまでの情報（技術概要、ターゲット、選択された課題）を元にVPCの各ブロックのドラフトを作成しますので、
+    それを参考に内容を編集・追記してください。
+    """)
+    with st.expander("💡 Value Proposition Canvasとは？"):
+        st.markdown("""
+        Value Proposition Canvasは、以下の2つの側面から顧客への価値提案を整理するフレームワークです。
+        * **顧客セグメント (右側):** 顧客が誰で、何をしようとし（顧客のジョブ）、何に困っていて（ペイン）、何を得たいか（ゲイン）を明確にします。
+        * **価値提案 (左側):** あなたの製品・サービスが、どのように顧客のペインを取り除き（ペインリリーバー）、ゲインを生み出すか（ゲインクリエイター）を定義します。
+        これらの整合性を高めることが重要です。
+        """)
     st.caption("AIが提案するドラフトを元に、顧客への提供価値を具体化しましょう。")
     st.divider()
 
-    # 必要な情報をsession_stateから取得
+    # ... (必要な情報取得は同じ) ...
     selected_target = st.session_state.get('selected_target', '')
-    potential_problems = st.session_state.get('potential_problems', '')
+    focused_problems_list = st.session_state.get('selected_problems', [])
     tech_summary = st.session_state.get('tech_summary', '')
 
-    # --- AIによるVPCドラフト生成 (まだ生成されていなければ) ---
-    if 'vpc_draft_text' not in st.session_state:
+    # --- AIによるVPCドラフト生成 (まだパース結果がなければ) ---
+    if 'parsed_vpc_blocks' not in st.session_state: # パース後のデータがあるかで判断
         st.info("AIがVPCドラフトを作成中です...")
-        if not selected_target or not potential_problems or not tech_summary:
-             st.error("VPC作成に必要な情報（ターゲット、課題、技術概要）が不足しています。前のステップに戻ってください。")
-             st.stop()
+        
+        # ... (vpc_prompt 作成は同じ。入力として focused_problems_list を使う) ...
+        vpc_prompt = f"""あなたは事業開発の専門家です。以下の提供情報**のみ**に基づいて、「Value Proposition Canvas」の6つの構成要素について、具体的なアイデアを提案・記述してください。過去の会話の文脈は考慮せず、今回提示された情報だけで判断してください。
 
-        # プロンプト作成 (VPC用)
-        vpc_prompt = f"""以下の「技術概要」「ターゲット候補」「ターゲットの課題リスト」に基づいて、「Value Proposition Canvas」の6つの構成要素について、具体的なアイデアを提案・記述してください。
-
-        # 技術概要:
+        # 提供情報
+        ## 技術概要:
         {tech_summary}
 
-        # ターゲット候補:
+        ## ターゲット候補:
         {selected_target}
 
-        # ターゲットの課題リスト:
-        {potential_problems}
+        ## ターゲットの【主要な】課題リスト (ユーザー選抜済):
+        {chr(10).join([f'* {p}' for p in focused_problems_list]) if focused_problems_list else "(ユーザーによって特に選択された課題はありません。ターゲット候補全般の一般的な課題を考慮してください。)"}
 
         # 作成するVPCの構成要素と記述内容の指示:
         1.  **顧客のジョブ (Customer Jobs):** ターゲット顧客が達成しようとしていること、解決したい仕事は何か？
-        2.  **顧客のペイン (Customer Pains):** 顧客が現状感じている不満、障害、リスクは何か？（上記の課題リストを参考に具体的に）
+        2.  **顧客のペイン (Customer Pains):** 顧客が現状感じている不満、障害、リスクは何か？（上記の【主要な】課題リストを最重要の参考情報として具体的に）
         3.  **顧客のゲイン (Customer Gains):** 顧客が期待する成果、メリット、喜びは何か？
         4.  **製品・サービス (Products & Services):** あなたの技術を元にした具体的な製品やサービス案は？
         5.  **ペインリリーバー (Pain Relievers):** その製品・サービスが、どのように顧客のペインを取り除くか？
         6.  **ゲインクリエイター (Gain Creators):** その製品・サービスが、どのように顧客のゲインを生み出すか？
 
-        # 出力形式 (各要素を見出しで区切ってください):
+        # 出力形式 (各要素を以下の見出しで明確に区切ってください):
         ## 顧客のジョブ (Customer Jobs)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         ## 顧客のペイン (Customer Pains)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         ## 顧客のゲイン (Customer Gains)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         ## 製品・サービス (Products & Services)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         ## ペインリリーバー (Pain Relievers)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         ## ゲインクリエイター (Gain Creators)
-        * [アイデア1]
-        * [アイデア2]
-        ...
+        [ここに具体的な記述を複数箇条書きで]
 
         マークダウン形式で記述してください。
         """
@@ -348,79 +457,127 @@ elif st.session_state.step == 1.3:
         try:
             with st.spinner("GeminiがVPCドラフトを作成中..."):
                 response_vpc = model.generate_content(vpc_prompt)
-                st.session_state.vpc_draft_text = response_vpc.text # 応答テキスト全体を保存
-                st.success("VPCドラフトの生成が完了しました。")
-                st.rerun() # 再実行して表示処理へ
+                vpc_raw_text = response_vpc.text
+                st.session_state.vpc_draft_text = vpc_raw_text # 生データも保存
+
+                # ★★★ AI応答をパースして session_state に保存 ★★★
+                if 'vpc_draft_text' in st.session_state and 'parsed_vpc_blocks' not in st.session_state: # まだパースされていなければ
+                    vpc_raw_text = st.session_state.vpc_draft_text
+                    if vpc_raw_text != "VPCドラフトの生成に失敗しました。": # エラーでない場合のみパース
+                        parsed_data = parse_vpc_response(vpc_raw_text)
+                        st.session_state.parsed_vpc_blocks = parsed_data
+                        st.success("VPCドラフトの解析が完了しました。") # メッセージ変更
+                        # st.rerun() # ここでのリランは不要
+
+        
         except Exception as e:
             st.error(f"VPCドラフト生成中にエラーが発生しました: {e}")
             st.session_state.vpc_draft_text = "VPCドラフトの生成に失敗しました。"
-        
-        st.divider()
-        st.write("--- DEBUG: Checking session state before VPC display ---")
-        st.write(f"--- DEBUG: 'vpc_draft_text' exists: {'vpc_draft_text' in st.session_state} ---")
-        if 'vpc_draft_text' in st.session_state:
-            st.write("--- DEBUG: Content of vpc_draft_text (first 500 chars): ---")
-            # st.markdownだとエラーになる可能性があるのでst.textを使う
-            st.text(st.session_state.vpc_draft_text[:500])
-        st.divider()
+            st.session_state.parsed_vpc_blocks = {} # エラー時は空の辞書
 
+            
     # --- VPCフレームワークと編集UIの表示 ---
     st.subheader("Value Proposition Canvas （編集可）")
 
-    # --- ★★★ ここからVPC表示と編集UIの実装 ★★★ ---
-    # (今回はまずAIの応答全体を表示する)
-    if 'vpc_draft_text' in st.session_state:
-        st.markdown("--- AIによるドラフト提案 ---")
-        st.markdown(st.session_state.vpc_draft_text)
-    else:
-         st.info("VPCドラフトを生成しています...")
+    if 'parsed_vpc_blocks' in st.session_state and st.session_state.parsed_vpc_blocks:
+            vpc_edit_data = st.session_state.parsed_vpc_blocks
 
-    # (将来的な実装イメージ：st.columns(2)とst.text_areaを6つ配置)
-    # col1, col2 = st.columns(2)
-    # with col1: # 価値提案側
-    #     st.subheader("価値提案")
-    #     products_services = st.text_area("製品・サービス", key="vpc_ps", height=150)
-    #     pain_relievers = st.text_area("ペインリリーバー", key="vpc_pr", height=150)
-    #     gain_creators = st.text_area("ゲインクリエイター", key="vpc_gc", height=150)
-    # with col2: # 顧客セグメント側
-    #     st.subheader("顧客セグメント")
-    #     customer_jobs = st.text_area("顧客のジョブ", key="vpc_cj", height=150)
-    #     pains = st.text_area("ペイン", key="vpc_p", height=150)
-    #     gains = st.text_area("ゲイン", key="vpc_g", height=150)
-    # --- ★★★ VPC表示と編集UIここまで ★★★ ---
+            col_vp, col_cs = st.columns(2)
+
+            with col_vp:
+                st.markdown("#### 価値提案 (Value Proposition)")
+                # ↓↓↓ 'st.session_state.vpc_ps_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "製品・サービス (Products & Services)",
+                    value=vpc_edit_data.get("製品・サービス", ""), key="vpc_ps_edit", height=150
+                )
+                # ↓↓↓ 'st.session_state.vpc_pr_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "ペインリリーバー (Pain Relievers)",
+                    value=vpc_edit_data.get("ペインリリーバー", ""), key="vpc_pr_edit", height=150
+                )
+                # ↓↓↓ 'st.session_state.vpc_gc_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "ゲインクリエイター (Gain Creators)",
+                    value=vpc_edit_data.get("ゲインクリエイター", ""), key="vpc_gc_edit", height=150
+                )
+
+            with col_cs:
+                st.markdown("#### 顧客セグメント (Customer Segment)")
+                # ↓↓↓ 'st.session_state.vpc_cj_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "顧客のジョブ (Customer Jobs)",
+                    value=vpc_edit_data.get("顧客のジョブ", ""), key="vpc_cj_edit", height=150
+                )
+                # ↓↓↓ 'st.session_state.vpc_p_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "ペイン (Pains)",
+                    value=vpc_edit_data.get("ペイン", ""), key="vpc_p_edit", height=150
+                )
+                # ↓↓↓ 'st.session_state.vpc_g_edit =' を削除 ↓↓↓
+                st.text_area(
+                    "ゲイン (Gains)",
+                    value=vpc_edit_data.get("ゲイン", ""), key="vpc_g_edit", height=150
+                )
+    else:
+        st.info("VPCドラフトを表示するデータがありません。")
 
     st.divider()
 
     # --- ナビゲーション ---
     col_nav1, col_nav2 = st.columns(2)
     with col_nav1:
-        if st.button("ステップ1.2（課題整理）に戻る", key="back_to_step1_2"):
+        if st.button("ステップ1.2（課題整理）に戻る", key="back_to_step1_2_from_vpc"): # キー名変更
             st.session_state.step = 1.2
-            if 'vpc_draft_text' in st.session_state:
-                del st.session_state.vpc_draft_text
-            # vpc_final があればそれも消す
-            if 'vpc_final_data' in st.session_state:
-                del st.session_state.vpc_final_data
+            if 'vpc_draft_text' in st.session_state: del st.session_state.vpc_draft_text
+            if 'parsed_vpc_blocks' in st.session_state: del st.session_state.parsed_vpc_blocks
+            # 編集中のデータをクリア
+            for k in ["vpc_ps_edit", "vpc_pr_edit", "vpc_gc_edit", "vpc_cj_edit", "vpc_p_edit", "vpc_g_edit"]:
+                if k in st.session_state: del st.session_state[k]
             st.rerun()
     with col_nav2:
-        if st.button("ステップ2a（Lean Canvas）へ進む", key="goto_step2a"):
-            # --- ↓↓↓ VPC内容の保存処理を追加 ↓↓↓ ---
+        if st.button("ステップ2a（Lean Canvas）へ進む", key="goto_step2a_from_vpc"): # キー名変更
+            # ★★★ 編集されたVPCの内容を st.session_state.vpc_final_data に保存 ★★★
             st.session_state.vpc_final_data = {
-                "顧客のジョブ": st.session_state.get("vpc_cj", ""), # keyはVPCのtext_areaで指定したものに合わせる
-                "ペイン": st.session_state.get("vpc_p", ""),
-                "ゲイン": st.session_state.get("vpc_g", ""),
-                "製品・サービス": st.session_state.get("vpc_ps", ""),
-                "ペインリリーバー": st.session_state.get("vpc_pr", ""),
-                "ゲインクリエイター": st.session_state.get("vpc_gc", "")
+                "顧客のジョブ": st.session_state.get("vpc_cj_edit", ""),
+                "ペイン": st.session_state.get("vpc_p_edit", ""),
+                "ゲイン": st.session_state.get("vpc_g_edit", ""),
+                "製品・サービス": st.session_state.get("vpc_ps_edit", ""),
+                "ペインリリーバー": st.session_state.get("vpc_pr_edit", ""),
+                "ゲインクリエイター": st.session_state.get("vpc_gc_edit", "")
             }
-            
-            st.session_state.step = 2.1 # Lean Canvasを 2.1 とする
-            st.rerun() # 次のステップへ
+            # st.write("DEBUG: Saved VPC Data for Step 2a:", st.session_state.vpc_final_data) # デバッグ表示
+            # st.info("VPCの内容を保存しました。")
 
+            st.session_state.step = 2.1
+            # Lean Canvas関連のデータをクリアして再生成させる
+            if 'lean_canvas_raw_output' in st.session_state: del st.session_state.lean_canvas_raw_output
+            if 'lean_canvas_score_text' in st.session_state: del st.session_state.lean_canvas_score_text
+            if 'lean_canvas_parsed_blocks' in st.session_state: del st.session_state.lean_canvas_parsed_blocks
+            st.rerun()
     
 # --- ステップ2a (2.1): Lean Canvas Draft + Score ---
 elif st.session_state.step == 2.1:
     st.header("ステップ2a: Lean Canvas ドラフト作成")
+    st.info("""
+    Lean Canvasを使って、ビジネスモデル全体の骨子を9つの要素で整理します。
+    AIがこれまでの情報（技術概要、ターゲット、課題、VPCなど）を元にドラフトと品質スコアを提案します。
+    各項目を具体的に記述し、ビジネスモデルとしての実現可能性や仮説を明確にしましょう。
+    """)
+    with st.expander("💡 Lean Canvasとは？"):
+        st.markdown("""
+        Lean Canvasは、特にスタートアップなどの新規事業に適したビジネスモデル構築・検証ツールです。以下の9つの要素で構成されます。
+        1.  **課題 (Problem):** 解決すべき顧客の課題は何か？
+        2.  **顧客セグメント (Customer Segments):** その課題を抱えるターゲット顧客は誰か？
+        3.  **独自の価値提案 (Unique Value Proposition):** なぜ顧客はあなたを選ぶのか？シンプルで強力なメッセージ。
+        4.  **解決策 (Solution):** 課題を解決する具体的な製品・サービス。
+        5.  **チャネル (Channels):** 顧客に価値を届ける経路。
+        6.  **収益の流れ (Revenue Streams):** どのように収益を上げるか。
+        7.  **コスト構造 (Cost Structure):** 事業運営にかかる主要なコスト。
+        8.  **主要指標 (Key Metrics):** ビジネスの成功を測る重要な指標。
+        9.  **圧倒的優位性 (Unfair Advantage):** 競合が容易に模倣できない強み。
+        これらの要素を埋めることで、ビジネスモデルの全体像と検証すべき仮説が見えてきます。
+        """)
     st.caption("これまでの情報を元にAIがLean Canvasのドラフトを作成し、品質スコアを算出します。")
     st.divider()
 
@@ -437,8 +594,59 @@ elif st.session_state.step == 2.1:
         if not tech_summary or not selected_target: # VPCと課題は任意入力から生成される可能性考慮
              st.error("Lean Canvas作成に必要な情報（技術概要、ターゲット）が不足しています。前のステップに戻ってください。")
              st.stop()
+                # --- ★★★ 1. AIによる市場調査用検索キーワード生成 ★★★ ---
+        market_search_keywords_generated = []
+        web_search_for_market_summary = ""
+        try:
+            with st.spinner("AIが市場調査用の検索キーワードを生成中... (1/3)"):
+                market_keyword_prompt = f"""以下の「技術概要」と「ターゲット顧客」に基づいて、この事業が参入する可能性のある市場の「市場規模」「最新トレンド」「主要な顧客セグメントの詳細」を調査するための効果的なGoogle検索キーワードを3つ提案してください。キーワードのみを箇条書きで出力してください。
 
-        # プロンプト作成 (入力をより明確に記述)
+                # 技術概要:
+                {tech_summary}
+
+                # ターゲット顧客:
+                {selected_target}
+                """
+                response_market_keywords = model.generate_content(market_keyword_prompt)
+                market_search_keywords_text = response_market_keywords.text
+                market_search_keywords_generated = [kw.strip("* ").strip() for kw in market_search_keywords_text.splitlines() if kw.strip() and not kw.strip().startswith("Please provide")]
+                st.write("DEBUG - AIが生成した市場調査用キーワード:", market_search_keywords_generated) # デバッグ用
+        except Exception as e:
+            st.warning(f"市場調査用キーワード生成中にエラー: {e}")
+
+        # --- ★★★ 2. Web検索実行 (Google Custom Search API) ★★★ ---
+        if market_search_keywords_generated:
+            try:
+                with st.spinner("市場情報をGoogle検索で収集中... (2/3)"):
+                    google_api_key = st.secrets["GOOGLE_API_KEY"]
+                    search_engine_id = st.secrets["SEARCH_ENGINE_ID"]
+                    service = build("customsearch", "v1", developerKey=google_api_key)
+                    market_search_snippets = []
+                    for keyword in market_search_keywords_generated[:3]: # 上位3キーワード
+                        res = service.cse().list(q=keyword, cx=search_engine_id, num=2).execute() # 各2件
+                        if 'items' in res:
+                            for item in res['items']:
+                                title = item.get('title', '')
+                                snippet = item.get('snippet', '').replace('\n', ' ')
+                                market_search_snippets.append(f"- {title}: {snippet}")
+                    if market_search_snippets:
+                        web_search_for_market_summary = "\n".join(market_search_snippets)
+                        st.write("DEBUG - 収集した市場情報（一部）:", web_search_for_market_summary[:200] + "...") # デバッグ用
+            except Exception as e:
+                st.warning(f"市場情報のWeb検索中にエラー: {e}")
+        else:
+            web_search_for_market_summary = "市場調査のためのキーワードが生成されなかったため、Web検索はスキップされました。"
+
+
+        # --- ★★★ 3. Lean Canvas生成AIへの情報提供 (プロンプト修正) ★★★ ---
+        # ↓↓↓ デバッグ表示を追加 ↓↓↓
+        st.write("--- DEBUG: Context for LC Prompt ---")
+        st.write("Tech Summary for LC (first 100 chars):", str(tech_summary)[:100] if tech_summary is not None else "N/A")
+        st.text_area("Selected Target for LC", selected_target, height=70)
+        st.text_area("VPC Data for LC", str(vpc_data), height=100) # 辞書を文字列に
+        st.text_area("Web Search Summary for LC (first 500 chars)", web_search_for_market_summary[:500] if web_search_for_market_summary else "N/A", height=100)
+        # ↑↑↑ デバッグ表示を追加 ↑↑↑
+
         input_context = f"""
         # 提供情報
 
@@ -460,30 +668,38 @@ elif st.session_state.step == 2.1:
         * ゲインクリエイター: {vpc_data.get('ゲインクリエイター', '(情報なし)')}
         """
 
-        lc_prompt = f"""{input_context}
-        ---
-        # 指示
-        上記の提供情報に基づいて、Lean Canvasの9つの構成要素のドラフトを作成してください。
+        lc_prompt = f"""以下の情報に基づいて、Lean Canvasの9つの構成要素のドラフトを作成してください。
+        特に「顧客セグメント」と、市場規模を示唆する「主要指標」の項目については、提供された「市場調査のWeb検索結果」を最大限活用してください。
         さらに、作成したドラフト全体について、事業アイデアの初期段階としての「品質スコア」を100点満点で採点し、その主な理由も記述してください。
+        **最終的な出力は、必ずLean Canvasの9ブロック全てと品質スコアを含めてください。**
 
-        # 作成するLean Canvasの構成要素:
-        1. 課題 (Problem): 上記のペインや技術概要から最も重要と考えられる課題を3つ程度
-        2. 顧客セグメント (Customer Segments): 上記ターゲット顧客をより具体的に
-        3. 独自の価値提案 (Unique Value Proposition): 提供価値を一言で。競合との違いを意識。
-        4. 解決策 (Solution): 製品・サービス、ペインリリーバー、ゲインクリエイターを元に具体的な解決策を記述。
-        5. チャネル (Channels): 顧客セグメントに到達するための経路案。
-        6. 収益の流れ (Revenue Streams): VPCや解決策から考えられる収益化のアイデア。
-        7. コスト構造 (Cost Structure): 解決策提供に必要な主要コスト要素の推定。
-        8. 主要指標 (Key Metrics): このビジネスの成功を測る初期指標案。
-        9. 圧倒的優位性 (Unfair Advantage): 技術概要やVPCから考えられる模倣困難な強み。
+        # 技術概要:
+        {tech_summary}
 
-        # 品質スコアの評価観点:
-        * 各項目の一貫性
-        * 価値提案の魅力度
-        * 課題と解決策のマッチ度
-        * 市場性のポテンシャル 等
+        # ターゲット顧客:
+        {selected_target}
 
-        # 出力形式 (マークダウン):
+        # Value Proposition Canvas の内容:
+        {vpc_data}
+
+        # 市場調査のWeb検索結果 (これを参考に市場規模や顧客セグメントを具体化):
+        {web_search_for_market_summary if web_search_for_market_summary else "（Web検索結果なし。一般的な知識で補完してください。）"}
+
+        # 作成するLean Canvasの構成要素 (9項目全て記述必須):
+        1. 課題 (Problem)
+        2. 顧客セグメント (Customer Segments)
+        3. 独自の価値提案 (Unique Value Proposition)
+        4. 解決策 (Solution)
+        5. チャネル (Channels)
+        6. 収益の流れ (Revenue Streams)
+        7. コスト構造 (Cost Structure)
+        8. 主要指標 (Key Metrics)
+        9. 圧倒的優位性 (Unfair Advantage)
+
+        # 品質スコアの評価観点: (前回と同じ)
+        # ...
+
+        # 出力形式 (マークダウン、各項目を見出しで明確に区切る):
         ## Lean Canvas Draft
         ### 1. 課題
         [記述]
@@ -497,24 +713,28 @@ elif st.session_state.step == 2.1:
         """
 
         try:
-            with st.spinner("GeminiがLean Canvasを作成・評価中..."):
+            with st.spinner("Web検索情報を元にGeminiがLean Canvasを作成・評価中... (3/3)"):
+                # ↓↓↓ デバッグ表示を追加 ↓↓↓
+                # st.text_area("DEBUG: Final LC Prompt sent to AI", lc_prompt, height=150) # 長すぎる場合はコメントアウト
+                # ↑↑↑ デバッグ表示を追加 ↑↑↑
                 response_lc = model.generate_content(lc_prompt)
                 raw_output = response_lc.text
-                st.session_state.lean_canvas_raw_output = raw_output # 生データ保存
+                st.session_state.lean_canvas_raw_output = raw_output
 
-                # ★★★ 改善されたパース関数を呼び出す ★★★
+                # ↓↓↓ デバッグ表示を追加 ↓↓↓
+                st.divider()
+                st.subheader("【デバッグ用】AIからのLean Canvas生応答（パース前）")
+                st.text_area("Raw LC Response from AI", raw_output, height=300)
+                st.divider()
+                # ↑↑↑ デバッグ表示を追加 ↑↑↑
+
                 parsed_score, parsed_blocks = parse_lean_canvas_response(raw_output)
                 st.session_state.lean_canvas_score_text = parsed_score
-                st.session_state.lean_canvas_parsed_blocks = parsed_blocks # パース結果を保存
-                st.success("Lean Canvasドラフトと品質スコアの作成・解析が完了しました。")
-                # st.rerun() # ここでは不要
-
+                st.session_state.lean_canvas_parsed_blocks = parsed_blocks
+                st.success("市場調査とLean Canvasドラフト作成が完了しました。")
         except Exception as e:
             st.error(f"Lean Canvas作成中にエラーが発生しました: {e}")
-            st.session_state.lean_canvas_raw_output = "Lean Canvasの作成に失敗しました。"
-            st.session_state.lean_canvas_score_text = "エラー"
-            st.session_state.lean_canvas_parsed_blocks = {} # 空の辞書
-
+   
     # --- Lean Canvas表示と編集UI ---
     st.subheader("Lean Canvas ドラフト （編集可）")
 
@@ -584,65 +804,88 @@ elif st.session_state.step == 2.1:
             st.session_state.step = 3 # ★ ステップ番号を 3 に設定 ★
             st.rerun() # ★ 再実行してステップ3へ遷移 ★
    
+
 # --- ステップ3: 深掘り ---
 elif st.session_state.step == 3:
     st.header("ステップ3: 深掘り分析")
+    st.info("""
+    このステップでは、Lean Canvasで描いたビジネスモデルの骨子を元に、さらに具体的な側面から事業アイデアを深掘りしていきます。
+    MVP（実用最小限の製品）、SWOT（強み・弱み・機会・脅威）、4P（製品・価格・流通・販促）、3C（顧客・競合・自社）、
+    そして初期的な財務計画について、AIの提案を参考にしながら検討を深めましょう。
+    各分析結果は編集可能です。
+    """)
     st.caption("Lean Canvasの内容などを元に、MVP、SWOTなどの分析を行います。")
     st.divider()
 
     # --- 必要な情報をsession_stateから取得 ---
     tech_summary = st.session_state.get('tech_summary', '')
     selected_target = st.session_state.get('selected_target', '')
+    lc_parsed_blocks = st.session_state.get('lean_canvas_parsed_blocks', {})
     # ... (VPCデータや、編集されたLean Canvasの各ブロックの値も必要に応じて取得) ...
     # 例: lean_canvas_data = { key.replace('lc_', ''): st.session_state[key] for key in st.session_state if key.startswith('lc_') }
     lean_canvas_problem = st.session_state.get('lc_課題', '') # key名を正確に指定
     lean_canvas_solution = st.session_state.get('lc_解決策', '')
     lean_canvas_uvp = st.session_state.get('lc_独自の価値提案', '')
-    # (他のLean Canvas項目も同様に取得)
-
+    lc_revenue = lc_parsed_blocks.get('収益の流れ', '')
+    lc_cost = lc_parsed_blocks.get('コスト構造', '')
+    
+    if (
+        'mvp_ideas_text' not in st.session_state or
+        'swot_analysis_text' not in st.session_state or
+        'four_p_analysis_text' not in st.session_state or
+        'three_c_analysis_text' not in st.session_state or
+        'financials_ideas_text' not in st.session_state
+    ):
+        st.info("AIが深掘り分析を実行中です。少々お待ちください...")
+        all_analyses_successful = True
+   
+   
     # --- MVP検討セクション ---
     with st.expander("MVP (Minimum Viable Product) の検討", expanded=True):
-        st.markdown("最小限の機能で顧客に価値を提供できる製品・サービス案を検討します。")
+        st.markdown("""
+        **MVP（実用最小限の製品）とは、顧客に価値を提供できる最小限の機能だけを備えた製品・サービスのことです。**
+        MVPを早期に構築し、実際の顧客に試してもらうことで、仮説を検証し、学習を重ねながら製品を改善していくことを目指します。
+        AIの提案を参考に、あなたの技術で最初に検証すべき核となる価値と、それを実現するシンプルな製品アイデアを考えてみましょう。
+        """)
 
         # AIにMVP案を提案させるボタン
-        if st.button("MVP案をAIに提案させる", key="generate_mvp"):
-            st.info("AIがMVP案を検討中です...")
-            # --- AI呼び出しロジック (MVP用) ---
-            mvp_context = f"""以下の情報を元に、実現可能で価値検証に適したMVP（Minimum Viable Product）のアイデアを2～3個提案してください。それぞれのMVPについて、主要な機能、ターゲットユーザー、検証したい仮説を簡潔に記述してください。
+        if 'mvp_ideas_text' not in st.session_state: 
+            mvp_prompt = f"""
+            以下の情報を元に、実現可能で価値検証に適したMVP（Minimum Viable Product）のアイデアを2～3個提案してください。それぞれのMVPについて、主要な機能、ターゲットユーザー、検証したい仮説を簡潔に記述してください。
 
-            # 技術概要:
-            {tech_summary}
+                # 技術概要:
+                {tech_summary}
 
-            # ターゲット顧客:
-            {selected_target}
+                # ターゲット顧客:
+                {selected_target}
 
-            # Lean Canvas - 課題:
-            {lean_canvas_problem}
+                # Lean Canvas - 課題:
+                {lean_canvas_problem if lean_canvas_problem else "（Lean Canvasの課題情報は提供されていません）"}
 
-            # Lean Canvas - 解決策:
-            {lean_canvas_solution}
+                # Lean Canvas - 解決策:
+                {lean_canvas_solution if lean_canvas_solution else "（Lean Canvasの解決策情報は提供されていません）"}
 
-            # Lean Canvas - 独自の価値提案:
-            {lean_canvas_uvp}
+                # Lean Canvas - 独自の価値提案:
+                {lean_canvas_uvp if lean_canvas_uvp else "（Lean CanvasのUVP情報は提供されていません）"}
 
-            # 出力形式 (マークダウン):
-            **MVP案1:**
-            * 主要機能: ...
-            * ターゲットユーザー（初期）: ...
-            * 検証したい仮説: ...
+                # 出力形式 (マークダウン):
+                **MVP案1:**
+                * 主要機能: ...
+                * ターゲットユーザー（初期）: ...
+                * 検証したい仮説: ...
 
-            **MVP案2:**
-            ... (同様に)
-            """
+                **MVP案2:**
+                ... (同様に)
+                """
             try:
                 with st.spinner("GeminiがMVP案を分析中..."):
-                    response_mvp = model.generate_content(mvp_context)
+                    response_mvp = model.generate_content(mvp_prompt)
                     st.session_state.mvp_ideas_text = response_mvp.text # 結果を保存
             except Exception as e:
                 st.error(f"MVP案生成中にエラー: {e}")
                 st.session_state.mvp_ideas_text = "MVP案の生成に失敗"
 
-        # AIが生成したMVP案の表示 (session_stateに保存後)
+            # AIが生成したMVP案の表示 (session_stateに保存後)
         if 'mvp_ideas_text' in st.session_state:
             st.subheader("AIによるMVP提案")
             st.markdown(st.session_state.mvp_ideas_text)
@@ -654,13 +897,17 @@ elif st.session_state.step == 3:
 
     # --- SWOT分析セクション ---
     with st.expander("SWOT分析", expanded=False):
-        st.markdown("事業を取り巻く内部環境（強み・弱み）と外部環境（機会・脅威）を分析します。")
+        st.markdown("""
+        **SWOT分析は、事業を取り巻く環境を以下の4つの観点から整理・分析するフレームワークです。**
+        * **強み (Strengths):** 目標達成に貢献する組織内部の強み。
+        * **弱み (Weaknesses):** 目標達成の障害となる組織内部の弱み。
+        * **機会 (Opportunities):** 目標達成に貢献する外部環境の機会。
+        * **脅威 (Threats):** 目標達成の障害となる外部環境の脅威。
+        AIが提案する各要素を参考に、自社の状況を客観的に把握しましょう。（クロスSWOT分析は今後のステップで検討します）
+        """)
 
-        # AIにSWOT分析を実行させるボタン
-        if st.button("SWOT分析をAIに実行させる", key="generate_swot"):
-            st.info("AIがSWOT分析を実行中です...")
-            # --- AI呼び出しロジック (SWOT用) ---
-            swot_context = f"""以下の情報を元に、この事業アイデアに関するSWOT分析（強み、弱み、機会、脅威）を行ってください。内部環境と外部環境の両面から、具体的な要素をリストアップしてください。
+        if 'swot_analysis' not in st.session_state: 
+            swot_prompt = f"""以下の情報を元に、この事業アイデアに関するSWOT分析（強み、弱み、機会、脅威）を行ってください。内部環境と外部環境の両面から、具体的な要素をリストアップしてください。
 
             # 技術概要:
             {tech_summary}
@@ -691,16 +938,16 @@ elif st.session_state.step == 3:
             """
             try:
                 with st.spinner("GeminiがSWOT分析を実行中..."):
-                     response_swot = model.generate_content(swot_context)
-                     st.session_state.swot_analysis_text = response_swot.text # 結果を保存
+                        response_swot = model.generate_content(swot_prompt)
+                        st.session_state.swot_analysis = response_swot.text # 結果を保存
             except Exception as e:
                 st.error(f"SWOT分析中にエラー: {e}")
-                st.session_state.swot_analysis_text = "SWOT分析の生成に失敗"
+                st.session_state.swot_analysis = "SWOT分析の生成に失敗"
 
         # AIが生成したSWOT分析結果の表示
-        if 'swot_analysis_text' in st.session_state:
+        if 'swot_analysis' in st.session_state:
             st.subheader("AIによるSWOT分析結果")
-            st.markdown(st.session_state.swot_analysis_text)
+            st.markdown(st.session_state.swot_analysis)
             st.divider()
 
         # ユーザーコメント欄
@@ -710,12 +957,17 @@ elif st.session_state.step == 3:
 
     # --- 4P分析セクション ---
     with st.expander("4P分析", expanded=False):
-        st.markdown("製品（Product）、価格（Price）、流通（Place）、販促（Promotion）の観点から戦略を検討します。")
+        st.markdown("""
+        **4P分析は、マーケティング戦略を以下の4つの要素から具体化するフレームワークです。**
+        * **Product（製品・サービス）:** どのような製品・サービスを提供するか？（品質、デザイン、ブランドなど）
+        * **Price（価格）:** どのような価格で提供するか？（価格設定、価格帯、割引戦略など）
+        * **Place（流通・チャネル）:** どのように顧客に届けるか？（販売場所、流通経路など）
+        * **Promotion（販促・プロモーション）:** どのように顧客に知ってもらい、購入を促すか？（広告、広報、販売促進活動など）
+        AIの提案を参考に、具体的なマーケティング施策のアイデアを練りましょう。
+        """)
 
-        # AIに4P分析を実行させるボタン
-        if st.button("4P分析をAIに実行させる", key="generate_4p"):
-            st.info("AIが4P分析を実行中です...")
-            # --- AI呼び出しロジック (4P用) ---
+    # AIに4P分析を実行させるボタン
+        if 'four_p_analysis_text' not in st.session_state: # MVPがまだ生成されていなければif st.button("4P分析をAIに実行させる", key="generate_4p"):
             # 必要なコンテキストを取得 (Lean Canvasの内容全体を使う例)
             lc_parsed_blocks = st.session_state.get('lean_canvas_parsed_blocks', {})
             lc_context = "\n".join([f"### {k}\n{v}" for k, v in lc_parsed_blocks.items()])
@@ -758,8 +1010,8 @@ elif st.session_state.step == 3:
             """
             try:
                 with st.spinner("Geminiが4P分析を実行中..."):
-                     response_4p = model.generate_content(four_p_prompt)
-                     st.session_state.four_p_analysis_text = response_4p.text # 結果を保存
+                        response_4p = model.generate_content(four_p_prompt)
+                        st.session_state.four_p_analysis_text = response_4p.text # 結果を保存
             except Exception as e:
                 st.error(f"4P分析中にエラー: {e}")
                 st.session_state.four_p_analysis_text = "4P分析の生成に失敗"
@@ -776,11 +1028,16 @@ elif st.session_state.step == 3:
 
     # --- 3C分析セクション ---
     with st.expander("3C分析", expanded=False):
-        st.markdown("顧客（Customer）、競合（Competitor）、自社（Company）の3つの観点から事業環境を分析します。")
+        st.markdown("""
+        **3C分析は、事業成功の鍵となる3つの要素の現状を分析し、戦略を導き出すフレームワークです。**
+        * **Customer（顧客・市場）:** ターゲット顧客は誰で、どのようなニーズを持っているか？市場規模や成長性は？
+        * **Competitor（競合）:** 主要な競合は誰で、どのような強み・弱みを持っているか？
+        * **Company（自社）:** 自社の経営資源（強み・弱み）は何か？顧客ニーズに応え、競合に勝つために何をすべきか？
+        AIがこれまでの情報を統合して提案する分析結果を元に、自社の立ち位置と戦略の方向性を確認しましょう。
+        """)
 
-        # AIに3C分析を実行させるボタン
-        if st.button("3C分析をAIに実行させる", key="generate_3c"):
-            st.info("AIが3C分析を実行中です...")
+    # AIに3C分析を実行させる
+        if 'three_c_analysis_text' not in st.session_state:
             # --- AI呼び出しロジック (3C用) ---
             # 必要なコンテキストを収集 (より多くの情報を活用)
             tech_summary = st.session_state.get('tech_summary', '')
@@ -793,7 +1050,7 @@ elif st.session_state.step == 3:
             # Lean Canvasから関連情報を抽出
             lc_customer = lc_parsed_blocks.get('顧客セグメント', '')
             lc_problem = lc_parsed_blocks.get('課題', '')
-            lc_competitor_advantage = lc_parsed_blocks.get('圧倒的優位性', '') # 競合情報含む可能性あり
+            lc_unfair_advantage = lc_parsed_blocks.get('lc_圧倒的優位性', '') # 競合情報含む可能性あり
             lc_solution = lc_parsed_blocks.get('解決策', '')
 
             three_c_prompt = f"""以下の提供情報に基づいて、3C分析（顧客、競合、自社）を行ってください。各要素について、重要なポイントを整理し、簡潔に記述してください。
@@ -815,7 +1072,7 @@ elif st.session_state.step == 3:
             * 顧客セグメント: {lc_customer}
             * 課題: {lc_problem}
             * 解決策: {lc_solution}
-            * 圧倒的優位性: {lc_competitor_advantage}
+            * 圧倒的優位性: {lc_unfair_advantage}
 
             ## SWOT分析結果:
             {swot_analysis}
@@ -839,8 +1096,8 @@ elif st.session_state.step == 3:
             """
             try:
                 with st.spinner("Geminiが3C分析を実行中..."):
-                     response_3c = model.generate_content(three_c_prompt)
-                     st.session_state.three_c_analysis_text = response_3c.text # 結果を保存
+                        response_3c = model.generate_content(three_c_prompt)
+                        st.session_state.three_c_analysis_text = response_3c.text # 結果を保存
             except Exception as e:
                 st.error(f"3C分析中にエラー: {e}")
                 st.session_state.three_c_analysis_text = "3C分析の生成に失敗"
@@ -857,11 +1114,14 @@ elif st.session_state.step == 3:
 
     # --- 財務計画（初期）セクション ---
     with st.expander("財務計画（初期）", expanded=False):
-        st.markdown("事業の主要な収益源、コスト構造、および初期段階で考慮すべき財務的なポイントを検討します。")
+        st.markdown("""
+        **ここでは、事業の初期段階における財務的な側面を大まかに捉えます。**
+        詳細な事業計画ではなく、主要な収益源、コスト構造、そして初期に考慮すべき財務的なポイント（価格設定の考え方、初期投資、資金調達の必要性など）についてAIがアイデアを提案します。
+        実現可能性のあるビジネスモデルを考える上での参考にしてください。
+        """)
 
         # AIに財務計画の初期アイデアを提案させるボタン
-        if st.button("財務計画（初期）のアイデアをAIに提案させる", key="generate_financials"):
-            st.info("AIが財務計画の初期アイデアを検討中です...")
+        if 'financials_ideas_text' not in st.session_state:
             # --- AI呼び出しロジック (財務初期用) ---
             # 必要なコンテキストを収集 (Lean Canvas, 4Pなど)
             tech_summary = st.session_state.get('tech_summary', '')
@@ -950,264 +1210,417 @@ elif st.session_state.step == 4:
 
     # --- 必要な情報をsession_stateから取得 ---
     tech_summary = st.session_state.get('tech_summary', '')
-    # (Lean Canvas, SWOTなどのデータも取得)
-    lc_competitors = st.session_state.get('lc_競合', '') # Lean Canvasの競合ブロックのキー名を確認
-    lc_unfair_advantage = st.session_state.get('lc_圧倒的優位性', '')
-    swot_analysis = st.session_state.get('swot_analysis_text', '') # SWOT分析の結果テキスト
+    lc_competitors_input = st.session_state.get('lc_競合', '') # Lean Canvasの競合キーを確認
+    lc_unfair_advantage = st.session_state.get('lc_圧倒的優位性', '') # Lean Canvasの優位性キーを確認
+    swot_analysis = st.session_state.get('swot_analysis_text', '')
 
-    # --- 競合分析セクション ---
-    with st.expander("競合分析", expanded=True):
-        st.markdown("主要な競合について、製品・サービス、強み・弱みなどを分析します。")
-        st.markdown("**Lean Canvasで挙げた競合（参考）:**")
-        st.text(lc_competitors if lc_competitors else "（Lean Canvasでの記述なし）")
-        st.divider()
+    # --- ステップ4のAI分析をここで実行 (まだ結果がなければ) ---
+    if not st.session_state.get('step4_analyses_complete', False):
+        st.info("AIが競合分析とMoat提案を実行中です。これには数分かかることがあります...")
+        all_analyses_successful_step4 = True # エラー追跡用フラグ
 
-        # AIに競合分析を依頼するボタン
-        if st.button("競合の詳細分析をAIに依頼する", key="generate_competitor_analysis"):
-            st.info("AIが競合分析を実行中です...")
-            # --- AI呼び出しロジック (競合分析用) ---
-            competitor_prompt = f"""以下の技術概要とLean Canvasで挙げられた競合情報を元に、主要な競合企業（または代替技術）を特定し、それぞれの特徴、強み、弱みを分析してください。
-
-            # 技術概要:
-            {tech_summary}
-
-            # Lean Canvas記載の競合（参考）:
-            {lc_competitors}
-
-            # 分析してほしい観点:
-            * 主要な競合企業/技術名
-            * 提供している製品/サービス
-            * 想定されるターゲット顧客
-            * 強み
-            * 弱み
-            * 価格帯やビジネスモデル（推測で可）
-
-            # 出力形式 (マークダウン):
-            ## 競合分析結果
-            ### 競合A: [企業名/技術名]
-            * 製品/サービス: ...
-            * ターゲット: ...
-            * 強み: ...
-            * 弱み: ...
-            * 価格/ビジネスモデル: ...
-            ### 競合B: [企業名/技術名]
-            ... (同様に)
-            """
+    
+    # --- 1. 競合分析 (Web検索あり) ---
+        if 'competitor_analysis_text' not in st.session_state:
+            web_search_results_summary = ""
+            search_keywords_generated_by_ai = []        # --- 1. AIによる検索キーワード生成 ---
             try:
-                with st.spinner("Geminiが競合を分析中..."):
-                    response_competitors = model.generate_content(competitor_prompt)
-                    st.session_state.competitor_analysis_text = response_competitors.text # 結果を保存
+                with st.spinner("AIが検索キーワードを生成中... (ステップ4 - 1/4)"):
+                    # ↓↓↓ キーワード生成プロンプトを修正 ↓↓↓
+                    keyword_prompt = f"""あなたは市場調査の専門家です。
+                    以下の「技術概要」と「既存の競合情報」のみに基づいて、詳細な競合分析を行うために効果的かつ具体的なGoogle検索キーワードを3～5個提案してください。
+                    これまでの会話の文脈は考慮せず、今回提示された情報だけで判断してください。
+                    キーワードのみを箇条書きで出力してください。
+
+                    # 技術概要:
+                    {tech_summary}
+
+                    # 既存の競合情報（あれば）:
+                    {lc_competitors_input if lc_competitors_input else "特になし"}
+                    """
+                    # ↑↑↑ キーワード生成プロンプトを修正 ↑↑↑
+                    response_keywords = model.generate_content(keyword_prompt)
+                    search_keywords_text = response_keywords.text
+                    search_keywords_generated_by_ai = [kw.strip("* ").strip() for kw in search_keywords_text.splitlines() if kw.strip() and not kw.strip().startswith("Please provide")] # AIがエラーを返した場合の対策
+                
+                # 1b. Web検索実行 (Google Custom Search API)　
+                if search_keywords_generated_by_ai:
+                    st.subheader("AIが生成した検索キーワード:")
+                    st.write(search_keywords_generated_by_ai)
+                else:
+                    st.warning("AIによる検索キーワード生成に失敗したか、キーワードがありませんでした。AIの応答を確認してください。")
+                    st.text(search_keywords_text) # AIの応答そのものを表示
+
+                # --- 2. Web検索の実行 (Google Custom Search API) ---
+                if search_keywords_generated_by_ai:
+                    with st.spinner("Google検索を実行し、関連情報を収集中... (ステップ4 - 2/4)"):
+                        google_api_key = st.secrets["GOOGLE_API_KEY"]
+                        search_engine_id = st.secrets["SEARCH_ENGINE_ID"]
+                        service = build("customsearch", "v1", developerKey=google_api_key)
+                        search_snippets = []
+
+                        for keyword in search_keywords_generated_by_ai[:3]:
+                            st.markdown(f"**'{keyword}' でGoogle検索中...**")
+                            try:
+                                res = service.cse().list(q=keyword, cx=search_engine_id, num=2).execute()
+                                if 'items' in res:
+                                    for item in res['items']:
+                                        title = item.get('title', 'タイトルなし')
+                                        link = item.get('link', '#')
+                                        snippet = item.get('snippet', '概要なし').replace('\n', ' ')
+                                        search_snippets.append(f"- タイトル: {title}\n  概要: {snippet}\n  URL: {link}\n")
+                            except Exception as search_e:
+                                st.warning(f"'{keyword}' のGoogle検索中にエラー: {search_e}") # エラーではなく警告
+                        if search_snippets:
+                            web_search_results_summary = "\n---\n".join(search_snippets)
+                else:
+                    web_search_results_summary = "検索キーワードがないか生成に失敗したため、Web検索はスキップされました。"
+
+                # --- 1c.  AIによる最終的な競合分析 (変更なし、web_search_results_summary を使用) ---
+                with st.spinner("Web検索結果を元にAIが最終分析中...(ステップ4 - 3/4)"):
+                     competitor_prompt_final = f"""以下の「技術概要」、「Lean Canvas記載の競合情報」、および「Web検索からの関連情報」に基づいて、主要な競合企業（または代替技術）を特定し、それぞれの特徴、強み、弱み、市場での評判や最近の動向などを詳細に分析してください。
+
+                    # 技術概要:
+                    {tech_summary}
+
+                    # Lean Canvas記載の競合情報（あれば）:
+                    {lc_competitors_input if lc_competitors_input else "特になし"}
+
+                    # Web検索からの関連情報:
+                    {web_search_results_summary if web_search_results_summary else "Web検索結果なし"}
+
+                    # 分析してほしい観点:
+                    * 主要な競合企業/技術名
+                    * 提供している製品/サービス
+                    * 想定されるターゲット顧客
+                    * 強み
+                    * 弱み
+                    * 価格帯やビジネスモデル（推測で可）
+                    * 市場での評判や最近の動向（Web検索結果から推測できる場合）
+
+                    # 出力形式 (マークダウン):
+                    ## 競合分析結果 (Web調査加味)
+                    ### 競合A: [企業名/技術名]
+                    * 製品/サービス: ...
+                    (以下、各観点について記述)
+                    ### 競合B: [企業名/技術名]
+                    ... (同様に)
+                    """
+                response_competitors = model.generate_content(competitor_prompt_final)
+                st.session_state.competitor_analysis_text = response_competitors.text
+            
             except Exception as e:
-                st.error(f"競合分析中にエラー: {e}")
+                st.error(f"競合分析プロセス中にエラー: {e}")
                 st.session_state.competitor_analysis_text = "競合分析の生成に失敗"
+                all_analyses_successful_step4 = False
 
-        # AIが生成した競合分析結果の表示
-        if 'competitor_analysis_text' in st.session_state:
-            st.subheader("AIによる競合分析結果")
-            st.markdown(st.session_state.competitor_analysis_text)
-            st.divider()
-
-        # ユーザーコメント欄
-        st.subheader("競合分析に関する追記・考察")
-        st.text_area("AIの分析結果に対する考察や、追加の競合情報などを記述してください。", height=150, key="competitor_notes_user")
-
-    # --- Moat定義セクション ---
-    with st.expander("優位性（Moat）の整理", expanded=True):
-        st.markdown("競合分析と自社の強みを踏まえ、持続可能な競争優位性（Moat）を定義します。")
-        st.markdown("**関連情報（参考）:**")
-        st.markdown(f"* Lean Canvas - 圧倒的優位性: {lc_unfair_advantage if lc_unfair_advantage else '（記述なし）'}")
-        # SWOTの強み部分を表示したいが、パースが必要なため、今は全体表示で代用
-        if 'swot_analysis_text' in st.session_state:
-             st.markdown(f"* SWOT分析（強みなど）:\n {st.session_state.swot_analysis_text}")
-        st.divider()
-
-
-        # AIにMoatの言語化を依頼するボタン
-        if st.button("Moat（圧倒的優位性）の言語化をAIに依頼する", key="generate_moat"):
-            st.info("AIがMoatの言語化を試みています...")
-            # --- AI呼び出しロジック (Moat用) ---
-            competitor_analysis_results = st.session_state.get('competitor_analysis_text', '') # 上で生成した競合分析結果
-
+           
+    # --- 2. Moat提案 (まだなければ、かつ競合分析が（一応）終わっていれば) ---
+        if 'moat_ideas_text' not in st.session_state:
+            # Moat生成に必要なコンテキストを取得
+            competitor_analysis_results_for_moat = st.session_state.get('competitor_analysis_text', '(競合分析結果なし)')
+            
             moat_prompt = f"""以下の情報に基づいて、この事業の持続可能な競争優位性（Moat）となりうる要素を特定し、それを表現する簡潔なステートメント案を1～3個提案してください。なぜそれが競合にとって模倣困難なのか、理由も添えてください。
 
             # 技術概要:
             {tech_summary}
 
             # Lean Canvas - 圧倒的優位性（ユーザー記述）:
-            {lc_unfair_advantage}
+            {lc_unfair_advantage if lc_unfair_advantage else "（記述なし）"}
 
             # SWOT分析結果:
-            {swot_analysis}
+            {swot_analysis if swot_analysis else "（SWOT分析結果なし）"}
 
-            # 競合分析結果:
-            {competitor_analysis_results}
+            # 競合分析結果 (Web調査加味):
+            {competitor_analysis_results_for_moat}
 
             # 出力形式 (マークダウン):
             ## Moat（持続可能な競争優位性）の提案
             **Moat案1:** [Moatを表すステートメント]
             * 理由: [なぜ模倣困難かの説明]
-
-            **Moat案2:** [Moatを表すステートメント]
-            * 理由: [なぜ模倣困難かの説明]
-            ... (最大3つまで)
+            (最大3つまで)
             """
             try:
-                with st.spinner("GeminiがMoatを分析中..."):
+                with st.spinner("GeminiがMoatを分析中... (ステップ4 - 4/4)"):
                      response_moat = model.generate_content(moat_prompt)
-                     st.session_state.moat_ideas_text = response_moat.text # 結果を保存
+                     st.session_state.moat_ideas_text = response_moat.text
             except Exception as e:
                 st.error(f"Moat生成中にエラー: {e}")
                 st.session_state.moat_ideas_text = "Moatの生成に失敗"
+                all_analyses_successful_step4 = False
+        
+        if all_analyses_successful_step4:
+            st.success("ステップ4のAI分析が完了しました。")
+            st.session_state.step4_analyses_complete = True # 完了フラグを立てる
+        else:
+            st.warning("ステップ4のAI分析中に一部エラーが発生しました。")
+        st.rerun() # 表示を確定させるためにリラン
 
-        # AIが生成したMoat案の表示
-        if 'moat_ideas_text' in st.session_state:
-            st.subheader("AIによるMoat提案")
-            st.markdown(st.session_state.moat_ideas_text)
+    # --- 競合分析セクション (表示と編集) ---
+    with st.expander("競合分析", expanded=True):
+        st.markdown("主要な競合について、製品・サービス、強み・弱みなどを分析します。")
+        # 個別の生成ボタンは削除
+        if 'competitor_analysis_text' in st.session_state:
+            st.subheader("AIによる競合分析結果 (Web検索加味)")
+            st.markdown(st.session_state.competitor_analysis_text)
             st.divider()
+        else:
+            st.info("競合分析結果を生成中です...") # AI処理中に表示される可能性
+        st.subheader("競合分析に関する追記・考察")
+        st.text_area("AIの分析結果に対する考察や、追加の競合情報などを記述してください。", height=150, key="competitor_notes_user_step4")
+
+    # --- Moat定義セクション (表示と編集) ---
+    with st.expander("優位性（Moat）の整理", expanded=True):
+        st.markdown("競合分析と自社の強みを踏まえ、持続可能な競争優位性（Moat）を定義します。")
+        # (関連情報の表示 - lc_unfair_advantage, swot_analysis)
+        st.markdown("**関連情報（参考）:**")
+        st.markdown(f"* Lean Canvas - 圧倒的優位性: {lc_unfair_advantage if lc_unfair_advantage else '（記述なし）'}")
+        if swot_analysis:
+             st.markdown(f"* SWOT分析（強みなど）:\n {swot_analysis}")
+        st.divider()
+        # 個別の生成ボタンは削除
+
+        # AIが生成したMoat案の表示と選択UI
+        if 'moat_ideas_text' in st.session_state:
+            st.subheader("AIによるMoat提案（参考にしてください）")
+            raw_moat_text = st.session_state.moat_ideas_text
+            moat_proposals = [] # パース結果を格納するリスト
+            if raw_moat_text and raw_moat_text != "Moatの生成に失敗":
+                # (ここにMoat案をパースするロジック - 前回実装したもの)
+                split_parts = re.split(r'(\*\*Moat案\s?\d+:\*\*)', raw_moat_text)
+                current_proposal = ""
+                for i_moat, part_moat in enumerate(split_parts):
+                    if part_moat.startswith("**Moat案"):
+                        if current_proposal: moat_proposals.append(current_proposal.strip())
+                        current_proposal = part_moat
+                    elif current_proposal: current_proposal += part_moat
+                if current_proposal: moat_proposals.append(current_proposal.strip())
+            
+            if moat_proposals:
+                for i, proposal_text in enumerate(moat_proposals):
+                    st.checkbox(f"Moat案 {i+1} を検討候補にする", key=f"moat_select_{i}")
+                    st.markdown(proposal_text)
+                    st.markdown("---")
+            else:
+                st.markdown(raw_moat_text) # パース失敗時は生データを表示
+            st.divider()
+        else:
+            st.info("Moat提案を生成中です...")
 
         # ユーザーが最終的なMoatを記述する欄
         st.subheader("最終的なMoatの定義")
-        st.text_area("AIの提案やこれまでの分析を踏まえ、この事業のMoatを定義してください。", height=150, key="moat_definition_user")
+        st.text_area("AIの提案やこれまでの分析を踏まえ、この事業のMoatを定義してください。", height=150, key="moat_definition_user_step4")
 
     st.divider()
-    
     # --- ナビゲーション ---
     col_nav1_step4, col_nav2_step4 = st.columns(2)
     with col_nav1_step4:
-        if st.button("ステップ3（深掘り）に戻る", key="back_to_step3"):
+        if st.button("ステップ3（深掘り）に戻る", key="back_to_step3_from_4_auto"):
             st.session_state.step = 3
-            # このステップで生成したデータをクリア
+            # このステップで生成した主要データをクリア
             if 'competitor_analysis_text' in st.session_state: del st.session_state.competitor_analysis_text
             if 'moat_ideas_text' in st.session_state: del st.session_state.moat_ideas_text
-            # ユーザー入力もクリアするかどうかは要検討
+            if 'step4_analyses_complete' in st.session_state: del st.session_state.step4_analyses_complete
             st.rerun()
-    
     with col_nav2_step4:
-        if st.button("ステップ5（ピッチ資料生成）へ進む", key="goto_step5"):
-            # ★★★ ここで最終的なMoat定義などを保存する処理が必要 ★★★
-            # st.session_state.final_moat = st.session_state.moat_definition_user
-            st.session_state.step = 5 # ステップ5へ
+        if st.button("ステップ5（ピッチ資料生成）へ進む", key="goto_step5_from_4_auto"):
+            # 選択されたAI Moat案とユーザー定義Moatを保存
+            selected_ai_moats = []
+            # (再度Moat案パースロジック - またはsession_stateからパース済みリストを取得)
+            # (上記表示部分の moat_proposals を使うのが理想だが、スコープの問題がある場合は再パース)
+            raw_moat_text_for_saving = st.session_state.get('moat_ideas_text', '')
+            parsed_moat_proposals_for_saving = [] # ここで再度パース処理が必要
+            if raw_moat_text_for_saving and raw_moat_text_for_saving != "Moatの生成に失敗":
+                # (Moat案パースロジックをここに再記述)
+                split_parts_for_saving = re.split(r'(\*\*Moat案\s?\d+:\*\*)', raw_moat_text_for_saving)
+                current_proposal_for_saving = ""
+                for i_save, part_save in enumerate(split_parts_for_saving):
+                    if part_save.startswith("**Moat案"):
+                        if current_proposal_for_saving: parsed_moat_proposals_for_saving.append(current_proposal_for_saving.strip())
+                        current_proposal_for_saving = part_save
+                    elif current_proposal_for_saving: current_proposal_for_saving += part_save
+                if current_proposal_for_saving: parsed_moat_proposals_for_saving.append(current_proposal_for_saving.strip())
+
+            for i, _proposal_text in enumerate(parsed_moat_proposals_for_saving): # _proposal_textは使わない
+                if st.session_state.get(f"moat_select_{i}", False):
+                    selected_ai_moats.append(parsed_moat_proposals_for_saving[i]) # 正しい提案テキストを追加
+
+            if selected_ai_moats:
+                st.session_state.selected_ai_moats_text_final = "\n\n".join(selected_ai_moats)
+            else:
+                if 'selected_ai_moats_text_final' in st.session_state: del st.session_state.selected_ai_moats_text_final
+            
+            st.session_state.final_moat_definition_user = st.session_state.get("moat_definition_user_step4", "")
+            
+            st.session_state.step = 5
+            # 次のステップで自動生成するので関連データをクリア
+            if 'pitch_deck_draft_text' in st.session_state: del st.session_state.pitch_deck_draft_text
+            if 'step4_analyses_complete' in st.session_state: del st.session_state.step4_analyses_complete # このステップの完了フラグもクリア
             st.rerun()
 
-# --- ステップ5: ピッチ資料自動生成 ---
+# --- ステップ5: ピッチ資料自動生成 (自動実行) ---
 elif st.session_state.step == 5:
     st.header("ステップ5: ピッチ資料 自動生成")
-    st.caption("これまでの分析結果を統合し、ピッチ資料の骨子をAIが生成します。")
+    st.caption("これまでの分析結果を統合し、ピッチ資料の骨子をAIが自動生成します。")
     st.divider()
 
-    # --- 必要な情報をsession_stateから取得 ---
-    # (これまでのステップで保存した全ての関連データを取得)
-    tech_summary = st.session_state.get('tech_summary', '')
-    selected_target = st.session_state.get('selected_target', '')
-    potential_problems = st.session_state.get('potential_problems', '')
-    vpc_data = st.session_state.get('vpc_final_data', {})
-    # Lean Canvas (個別のキーから取得またはパース結果辞書から)
-    lc_parsed_blocks = st.session_state.get('lean_canvas_parsed_blocks', {})
-    lc_score_text = st.session_state.get('lean_canvas_score_text','')
-    # MVP, SWOT, 4P, 3C, Financials, Competitors, Moat
-    mvp_definition = st.session_state.get('mvp_definition_user', '')
-    swot_analysis = st.session_state.get('swot_analysis_text', '')
-    four_p_analysis = st.session_state.get('four_p_analysis_text', '')
-    three_c_analysis = st.session_state.get('three_c_analysis_text', '')
-    financials_ideas = st.session_state.get('financials_ideas_text', '')
-    competitor_analysis = st.session_state.get('competitor_analysis_text', '')
-    moat_definition = st.session_state.get('moat_definition_user', '') # ユーザー定義のMoatを使う
+    # --- AIによるピッチ資料骨子生成 (まだ結果がなければ自動実行) ---
+    if 'pitch_deck_draft_text' not in st.session_state:
+        st.info("AIがピッチ資料骨子を生成中です... これまでの全情報を集約するため、少々お時間がかかります。")
 
-    # --- ピッチ資料生成ボタン ---
-    if st.button("ピッチ資料の骨子を生成する", key="generate_pitch"):
-        st.info("AIがピッチ資料骨子を生成中です...")
+        # --- 必要な情報をsession_stateから取得 ---
+        tech_summary = st.session_state.get('tech_summary', '(技術概要の情報なし)')
+        selected_target = st.session_state.get('selected_target', '(ターゲット顧客の情報なし)')
+        selected_problems = st.session_state.get('selected_problems', []) # 選択された課題リスト
+        focused_problems_text = "\n".join([f"* {p}" for p in selected_problems]) if selected_problems else "(特に選択/記述された課題なし)"
+        
+        vpc_data = st.session_state.get('vpc_final_data', {}) # 編集後のVPCデータ
+        vpc_text = "\n".join([f"* {key}: {value}" for key, value in vpc_data.items() if value]) if vpc_data else "(VPC情報なし)"
+
+        # Lean Canvas (編集後の各ブロックの値を取得)
+        lc_keys = ["課題", "顧客セグメント", "独自の価値提案", "解決策", "チャネル", "収益の流れ", "コスト構造", "主要指標", "圧倒的優位性"]
+        lean_canvas_content = "## Lean Canvas 内容:\n"
+        for key_lc in lc_keys:
+            session_key_lc = f"lc_{key_lc.replace(' ', '_')}"
+            lean_canvas_content += f"### {key_lc}\n{st.session_state.get(session_key_lc, '(記述なし)')}\n\n"
+        
+        mvp_definition = st.session_state.get('mvp_definition_user_step3', '(MVP定義なし)')
+        swot_analysis = st.session_state.get('swot_analysis_text', '(SWOT分析結果なし)')
+        four_p_analysis = st.session_state.get('four_p_analysis_text', '(4P分析結果なし)')
+        three_c_analysis = st.session_state.get('three_c_analysis_text', '(3C分析結果なし)')
+        financials_ideas = st.session_state.get('financials_ideas_text', '(財務計画初期アイデアなし)')
+        competitor_analysis = st.session_state.get('competitor_analysis_text', '(競合分析結果なし)')
+        
+        # Moat情報 (選択されたAI案とユーザー最終定義の両方を考慮)
+        selected_ai_moats = st.session_state.get('selected_ai_moats_text_final', '')
+        final_user_moat = st.session_state.get('final_moat_definition_user', '') # キー名を合わせる
+        
+        moat_info_for_prompt = ""
+        if selected_ai_moats:
+            moat_info_for_prompt += f"\nAI提案Moat(ユーザー選択):\n{selected_ai_moats}"
+        if final_user_moat: # ユーザー定義Moatを優先または併記
+            moat_info_for_prompt += f"\n最終Moat定義(ユーザー記述):\n{final_user_moat}"
+        if not moat_info_for_prompt: # どちらも無い場合
+            moat_info_for_prompt = "\nMoat（持続可能な競争優位性）:\n(ステップ4で定義されていません)"
+
         # --- AI呼び出しロジック (ピッチ資料生成用) ---
-        # 全ての情報をプロンプトのコンテキストとして組み立てる
         full_context = f"""以下は、ある技術シーズの事業化検討プロセスで整理された情報です。
-        これらの情報を統合・要約し、指定された11項目のピッチ資料構成に沿った骨子を作成してください。
-        各項目の記述には、可能であればその根拠となった分析要素（例：SWOT分析、市場規模調査など）を括弧書きで示唆してください。
+        これらの情報を戦略的に統合・要約し、指定された11項目のピッチ資料構成に沿った「発表用の骨子テキスト」を作成してください。
+        各項目の記述には、可能であればその根拠となった分析要素（例：SWOT分析より、市場調査より等）を括弧書きで簡潔に示唆してください。
 
-        # 技術概要:
+        # 提供情報サマリー
+        ## 技術概要:
         {tech_summary}
 
-        # ターゲット顧客:
+        ## ターゲット顧客:
         {selected_target}
 
-        # 顧客の課題リスト:
-        {potential_problems}
+        ## 顧客の主要な課題 (ユーザー選抜済):
+        {focused_problems_text}
 
-        # Value Proposition Canvas:
-        {vpc_data}
+        ## Value Proposition Canvas:
+        {vpc_text}
 
-        # Lean Canvas Draft & Score:
-        {st.session_state.get('lean_canvas_raw_output', '')}
+        ## Lean Canvas:
+        {lean_canvas_content}
 
-        # MVP定義:
+        ## MVP定義:
         {mvp_definition}
 
-        # SWOT分析:
+        ## SWOT分析:
         {swot_analysis}
 
-        # 4P分析:
+        ## 4P分析:
         {four_p_analysis}
 
-        # 3C分析:
+        ## 3C分析:
         {three_c_analysis}
 
-        # 財務計画（初期アイデア）:
+        ## 財務計画（初期アイデア）:
         {financials_ideas}
 
-        # 競合分析:
+        ## 競合分析:
         {competitor_analysis}
 
-        # Moat（持続可能な競争優位性）の定義:
-        {moat_definition}
+        ## Moat（持続可能な競争優位性）:
+        {moat_info_for_prompt}
 
         ---
-        # 作成するピッチ資料構成（11項目 - この見出しを使用）:
+        # 作成するピッチ資料構成（11項目 - 必ずこの見出しと順番で出力）:
         ## 1. タイトル
-        ## 2. 顧客の課題
-        ## 3. 解決策
-        ## 4. 市場規模
-        ## 5. 競合
-        ## 6. 差別化ポイント・優位性（Moat含む）
-        ## 7. ビジネスモデル
-        ## 8. なぜ今か
-        ## 9. なぜ自分（この会社）か
-        ## 10. 事業計画の骨子（3年）
-        ## 11. 収支計画の概算（3年）
+        [ここに事業タイトル案とキャッチコピー]
 
-        マークダウン形式で記述してください。
+        ## 2. 顧客の課題
+        [ここに記述。提供情報の「顧客の主要な課題」を元に、最も重要な課題を2-3点に絞り、箇条書き3点で具体的に記述]
+
+        ## 3. 解決策
+        [ここに記述。技術概要とVPCの「製品・サービス」「ペインリリーバー」「ゲインクリエイター」を元に、課題をどう解決するかを主要なポイントを箇条書きで明確に]
+
+        ## 4. 市場規模
+        [ここに記述。Lean Canvasの市場規模に関する情報を元に、具体的な市場規模と成長性、そのデータソースの示唆を箇条書きで]
+
+        ## 5. 競合
+        [ここに記述。競合分析の結果を元に、主要な競合とその特徴を簡潔に箇条書きで]
+
+        ## 6. 差別化ポイント・優位性（Moat含む）
+        [ここに記述。Moat情報、SWOTの強み、Lean Canvasの圧倒的優位性を元に、競合に対する明確なアドバンテージを箇条書きで簡潔に説明]
+
+        ## 7. ビジネスモデル
+        [ここに記述。Lean Canvasの収益の流れとコスト構造、4Pの価格戦略を元に、主要な収益化の方法を箇条書きで簡潔に説明]
+
+        ## 8. なぜ今か
+        [ここに記述。市場トレンド、技術的進展、社会情勢などを踏まえ、今この事業を始めるべき理由を完結に説明]
+
+        ## 9. なぜ自分（この会社）か
+        [ここに記述。技術的な強み、チームの専門性（あれば）、独自リソースなどを元に、この事業を成功させられる理由を箇条書きで簡潔に説明]
+
+        ## 10. 事業計画の骨子（3年）
+        [ここに記述。MVPから始め、段階的にどのようなマイルストーン（例：ユーザー獲得、製品開発、収益化）を目指すかの概要を箇条書きで簡潔に]
+
+        ## 11. 収支計画の概算（3年）
+        [ここに記述。主要な収益源とコスト構造から、非常に大まかな収益と費用の見通し、必要な初期投資の規模感などを示唆]
+
+        ---
+        各項目の内容は、投資家や経営層に伝えることを意識し、具体的で説得力のあるものにしてください。マークダウン形式で記述してください。
         """
 
         try:
-            with st.spinner("Geminiがピッチ資料骨子を生成中..."):
+            with st.spinner("Geminiがピッチ資料骨子を全力で生成中..."):
                 response_pitch = model.generate_content(full_context)
-                st.session_state.pitch_deck_draft_text = response_pitch.text # 結果を保存
+                st.session_state.pitch_deck_draft_text = response_pitch.text
                 st.success("ピッチ資料骨子の生成が完了しました。")
+                st.rerun() # 表示を更新するためにリラン
         except Exception as e:
             st.error(f"ピッチ資料骨子生成中にエラー: {e}")
-            st.session_state.pitch_deck_draft_text = "ピッチ資料骨子の生成に失敗"
+            st.session_state.pitch_deck_draft_text = "ピッチ資料骨子の生成に失敗しました。"
+            # st.rerun() # エラーでも一度リランしてエラーメッセージを表示させる
 
     # --- 生成されたピッチ資料骨子の表示 ---
     if 'pitch_deck_draft_text' in st.session_state:
-        st.divider()
         st.subheader("生成されたピッチ資料骨子（案）")
         st.markdown(st.session_state.pitch_deck_draft_text)
-        # コピーボタンを追加すると便利
-        if st.button("骨子をクリップボードにコピー", key="copy_pitch"):
-             # pyperclipライブラリが必要になる場合がある (pip install pyperclip)
-             # import pyperclip
-             # pyperclip.copy(st.session_state.pitch_deck_draft_text)
-             st.success("コピーしました！") # Note: Streamlitにはネイティブのコピーボタンはないため、外部ライブラリかJavaScriptを使う必要あり。これは簡易表示。
+        # コピーボタン (簡易版)
+        if st.button("骨子をクリップボードにコピー", key="copy_pitch_final"):
+             st.success("コピーしました！（実際にはテキストを選択してコピーしてください）") # Streamlit単体でのクリップボードアクセスは難しい
+    else:
+        # API呼び出し中や、何らかの理由でまだ結果がない場合に表示
+        st.info("ピッチ資料骨子を準備中です。")
 
 
     st.divider()
     # --- ナビゲーション ---
     col_nav1_step5, col_nav2_step5 = st.columns(2)
     with col_nav1_step5:
-        if st.button("ステップ4（競合/Moat）に戻る", key="back_to_step4"):
+        if st.button("ステップ4（競合/Moat）に戻る", key="back_to_step4_from_5"): # キー名変更
             st.session_state.step = 4
             if 'pitch_deck_draft_text' in st.session_state: del st.session_state.pitch_deck_draft_text
             st.rerun()
     with col_nav2_step5:
-        if st.button("ステップ6（VCレビュー）へ進む", key="goto_step6"):
-            st.session_state.step = 6 # ステップ6へ
+        if st.button("ステップ6（VCレビュー）へ進む", key="goto_step6_from_5"): # キー名変更
+            st.session_state.step = 6
+            # VCレビューはステップ6で自動生成するので、ここではクリア不要
+            if 'vc_review_results_text' in st.session_state:
+                del st.session_state.vc_review_results_text # 前回のVCレビュー結果があればクリア
             st.rerun()
 
 # --- ステップ6: VC/役員レビュー ---

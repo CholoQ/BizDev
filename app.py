@@ -371,7 +371,7 @@ elif st.session_state.step == 1.2:
             st.rerun()
     with col_nav2:
         # ↓↓↓ ボタンのロジックを修正 ↓↓↓
-        if st.button("選択した課題でVPC作成へ進む", key="goto_vpc_from_1_2"): # ボタン名変更、キー名変更
+        if st.button("ステップ2 選択した課題でVPC作成へ進む", key="goto_vpc_from_1_2"): # ボタン名変更、キー名変更
             if selected_problems_list: # 課題が1つ以上選択されているかチェック
                 # 選択された課題リストをsession_stateに保存
                 st.session_state.selected_problems = selected_problems_list
@@ -639,14 +639,6 @@ elif st.session_state.step == 2.1:
 
 
         # --- ★★★ 3. Lean Canvas生成AIへの情報提供 (プロンプト修正) ★★★ ---
-        # ↓↓↓ デバッグ表示を追加 ↓↓↓
-        st.write("--- DEBUG: Context for LC Prompt ---")
-        st.write("Tech Summary for LC (first 100 chars):", str(tech_summary)[:100] if tech_summary is not None else "N/A")
-        st.text_area("Selected Target for LC", selected_target, height=70)
-        st.text_area("VPC Data for LC", str(vpc_data), height=100) # 辞書を文字列に
-        st.text_area("Web Search Summary for LC (first 500 chars)", web_search_for_market_summary[:500] if web_search_for_market_summary else "N/A", height=100)
-        # ↑↑↑ デバッグ表示を追加 ↑↑↑
-
         input_context = f"""
         # 提供情報
 
@@ -714,19 +706,9 @@ elif st.session_state.step == 2.1:
 
         try:
             with st.spinner("Web検索情報を元にGeminiがLean Canvasを作成・評価中... (3/3)"):
-                # ↓↓↓ デバッグ表示を追加 ↓↓↓
-                # st.text_area("DEBUG: Final LC Prompt sent to AI", lc_prompt, height=150) # 長すぎる場合はコメントアウト
-                # ↑↑↑ デバッグ表示を追加 ↑↑↑
                 response_lc = model.generate_content(lc_prompt)
                 raw_output = response_lc.text
                 st.session_state.lean_canvas_raw_output = raw_output
-
-                # ↓↓↓ デバッグ表示を追加 ↓↓↓
-                st.divider()
-                st.subheader("【デバッグ用】AIからのLean Canvas生応答（パース前）")
-                st.text_area("Raw LC Response from AI", raw_output, height=300)
-                st.divider()
-                # ↑↑↑ デバッグ表示を追加 ↑↑↑
 
                 parsed_score, parsed_blocks = parse_lean_canvas_response(raw_output)
                 st.session_state.lean_canvas_score_text = parsed_score
@@ -1652,7 +1634,7 @@ elif st.session_state.step == 6:
         # プロンプト作成 (VC評価用 - 以前のものと同様)
         vc_review_prompt = f"""あなたは、革新的な技術シーズの事業化可能性を評価する、経験豊富で厳しい視点を持つベンチャーキャピタリスト（VC）です。ビジネスとしての「儲かるか」「スケールするか」「持続可能か」という観点を最も重視します。
 
-        以下の「ピッチ資料骨子」をVCの視点から厳しく評価し、下記の形式でフィードバックを出力してください。
+        以下の「ピッチ資料骨子」をVCの視点から厳しく評価し、下記の形式で箇条書きで簡潔にフィードバックを出力してください。
 
         # 評価対象ピッチ資料骨子:
         ---
@@ -1661,9 +1643,9 @@ elif st.session_state.step == 6:
 
         # 出力形式:
         1.  **事業評価スコア（10点満点）:**
-            * ビジネスとしての魅力度、ピッチ内容の完成度を総合的に10点満点で評価し、その主な根拠を簡潔に述べてください。
+            * ビジネスとしての魅力度、ピッチ内容の完成度を総合的に10点満点で評価し、その主な根拠を箇条書きで簡潔に述べてください。
         2.  **課題リスト:**
-            * このピッチ内容や事業計画における、特に問題となる点、リスク、さらなる深掘りや改善が必要な点を「課題」として具体的にリストアップしてください。各課題について、なぜそれが問題なのかをVC視点で説明してください。
+            * このピッチ内容や事業計画における、特に問題となる点、リスク、さらなる深掘りや改善が必要な点を「課題」として具体的にリストアップしてください。各課題について、なぜそれが問題なのかをVC視点で箇条書きで簡潔に説明してください。
         3.  **Next Actionリスト:**
             * 上記の課題を解決し、事業化や資金調達に向けて次に行うべき具体的なアクションを優先度が高い順に提案してください。各アクションについて、それが「LLMに手伝ってもらえること」か「起業家/研究者自身が行う必要があること」かを明記してください。
 
